@@ -1,12 +1,21 @@
 if _G.JJ1_Combo_Conns then
     for _, v in pairs(_G.JJ1_Combo_Conns) do
-        pcall(function() v:Disconnect() end)
+        pcall(function()
+            if typeof(v) == "RBXScriptConnection" then
+                v:Disconnect()
+            elseif type(v) == "table" and v.Disconnect then
+                v:Disconnect()
+            end
+        end)
     end
     _G.JJ1_Combo_Conns = nil
 end
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
 local CoreGui = game:GetService("CoreGui")
 
 local LP = Players.LocalPlayer
@@ -14,12 +23,24 @@ local LP = Players.LocalPlayer
 local isTpSkillEnabled = false
 local selectedTargetUserId = nil
 local searchQuery = ""
-local tpCooldown = false
 local currentScreenGui = nil
+local activeStickConn = nil
+local activeTween = nil
+
+local MIN_TWEEN_RANGE = 12
+local MAX_TWEEN_RANGE = 80
+
+local TWEEN_SPEED = 140
+local MIN_TWEEN_TIME = 0.05
+local MAX_TWEEN_TIME = 0.40
+local STICK_DURATION = 0.22
+local LEAD_TIME = 0.14
+local BEHIND_OFFSET = 2.2
 
 local SKILL_KEYS = {
     one = true, two = true, three = true, four = true,
-    e = true, q = true, r = true, f = true
+    e = true, q = true, r = true, f = true,
+    buttonx = true, buttony = true, buttonb = true, buttonr1 = true, buttonl1 = true
 }
 
 local RAW_ABILITY_NAMES = {
@@ -89,28 +110,65 @@ for _, name in ipairs(RAW_ABILITY_NAMES) do
     end
 end
 
+local function detectPlatform()
+    if GuiService:IsTenFootInterface() then
+        return "Console"
+    end
+    local hasTouch = UserInputService.TouchEnabled
+    local hasKeyboard = UserInputService.KeyboardEnabled
+    local hasMouse = UserInputService.MouseEnabled
+    local hasGamepad = UserInputService.GamepadEnabled
+
+    if hasTouch and not hasKeyboard then
+        return "Mobile"
+    end
+    if hasGamepad and not hasKeyboard and not hasMouse then
+        return "Console"
+    end
+    if hasKeyboard or hasMouse then
+        return "PC"
+    end
+    return hasTouch and "Mobile" or "PC"
+end
+
+local detectedPlatform = detectPlatform()
+
 local char = nil
 local hrp = nil
 local uiRefs = {}
 local hookedButtons = {}
 
+local function stopActiveMotion()
+    if activeStickConn then
+        activeStickConn:Disconnect()
+        activeStickConn = nil
+    end
+    if activeTween then
+        pcall(function() activeTween:Cancel() end)
+        activeTween = nil
+    end
+end
+
 local function getTargetPlayer()
+    if not hrp then return nil, nil end
+
     if selectedTargetUserId then
         local plr = Players:GetPlayerByUserId(selectedTargetUserId)
         if plr and plr ~= LP and plr.Character then
             local tHrp = plr.Character:FindFirstChild("HumanoidRootPart")
             local tHum = plr.Character:FindFirstChildOfClass("Humanoid")
             if tHrp and tHum and tHum.Health > 0 then
-                return plr, tHrp
+                local dist = (tHrp.Position - hrp.Position).Magnitude
+                if dist <= MAX_TWEEN_RANGE then
+                    return plr, tHrp
+                end
             end
         end
     end
 
-    if not hrp then return nil, nil end
-
     local closestPlr = nil
     local closestHrp = nil
-    local bestDist = math.huge
+    local bestDist = MAX_TWEEN_RANGE
 
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LP and plr.Character then
@@ -118,7 +176,7 @@ local function getTargetPlayer()
             local tHum = plr.Character:FindFirstChildOfClass("Humanoid")
             if tHrp and tHum and tHum.Health > 0 then
                 local dist = (tHrp.Position - hrp.Position).Magnitude
-                if dist < bestDist then
+                if dist <= bestDist then
                     bestDist = dist
                     closestPlr = plr
                     closestHrp = tHrp
@@ -139,7 +197,12 @@ local function refreshTargetLabel()
             return
         end
     end
-    uiRefs.TargetInfo.Text = "Target: Nearest Player"
+    uiRefs.TargetInfo.Text = "Target: Nearest (" .. tostring(MAX_TWEEN_RANGE) .. "m)"
+end
+
+local function refreshPlatformLabel()
+    if not uiRefs.PlatformInfo then return end
+    uiRefs.PlatformInfo.Text = "Platform: " .. detectedPlatform
 end
 
 local function refreshToggleButton()
@@ -211,19 +274,100 @@ local function rebuildPlayerList()
     end)
 end
 
+local function computeStrikeCFrame(targetHrp)
+    local vel = targetHrp.AssemblyLinearVelocity
+    local flatVel = Vector3.new(vel.X, 0, vel.Z)
+    local predictedPos = targetHrp.Position + (flatVel * LEAD_TIME)
+
+    local moveDir = flatVel.Magnitude > 1 and flatVel.Unit or targetHrp.CFrame.LookVector
+    local strikePos = predictedPos - (moveDir * BEHIND_OFFSET) + Vector3.new(0, 0.25, 0)
+
+    return CFrame.lookAt(strikePos, predictedPos)
+end
+
+local function startStickPhase(targetHrp)
+    if activeStickConn then
+        activeStickConn:Disconnect()
+        activeStickConn = nil
+    end
+
+    local startTime = os.clock()
+    activeStickConn = RunService.Heartbeat:Connect(function()
+        if not isTpSkillEnabled or not hrp or not hrp.Parent or not targetHrp or not targetHrp.Parent then
+            if activeStickConn then
+                activeStickConn:Disconnect()
+                activeStickConn = nil
+            end
+            return
+        end
+
+        if (os.clock() - startTime) >= STICK_DURATION then
+            activeStickConn:Disconnect()
+            activeStickConn = nil
+            return
+        end
+
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.CFrame = computeStrikeCFrame(targetHrp)
+    end)
+end
+
 local function tpToTargetForHit()
-    if not isTpSkillEnabled or tpCooldown or not hrp or not hrp.Parent then return end
+    if not isTpSkillEnabled or not hrp or not hrp.Parent then return end
 
     local _, targetHrp = getTargetPlayer()
     if not targetHrp then return end
 
-    tpCooldown = true
-    local behindPos = targetHrp.Position - (targetHrp.CFrame.LookVector * 3) + Vector3.new(0, 0.5, 0)
-    hrp.CFrame = CFrame.lookAt(behindPos, targetHrp.Position)
+    local dist = (targetHrp.Position - hrp.Position).Magnitude
+    if dist > MAX_TWEEN_RANGE then
+        return
+    end
 
-    task.delay(0.12, function()
-        tpCooldown = false
-    end)
+    stopActiveMotion()
+    hrp.AssemblyLinearVelocity = Vector3.zero
+
+    local goalCf = computeStrikeCFrame(targetHrp)
+
+    -- Chỉ tween khi khoảng cách nằm trong phạm vi [MIN_TWEEN_RANGE, MAX_TWEEN_RANGE]
+    if dist >= MIN_TWEEN_RANGE and dist <= MAX_TWEEN_RANGE then
+        local tweenDuration = math.clamp(dist / TWEEN_SPEED, MIN_TWEEN_TIME, MAX_TWEEN_TIME)
+        local info = TweenInfo.new(tweenDuration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        local tween = TweenService:Create(hrp, info, { CFrame = goalCf })
+        activeTween = tween
+
+        tween.Completed:Connect(function(playbackState)
+            if activeTween == tween then
+                activeTween = nil
+            end
+            if playbackState == Enum.PlaybackState.Completed and isTpSkillEnabled and hrp and hrp.Parent and targetHrp and targetHrp.Parent then
+                startStickPhase(targetHrp)
+            end
+        end)
+
+        tween:Play()
+    else
+        -- Gần hơn MIN_TWEEN_RANGE thì đặt thẳng vào vị trí đánh và bám dính luôn
+        hrp.CFrame = goalCf
+        startStickPhase(targetHrp)
+    end
+end
+
+local function isPointInsideGui(guiObj, pos)
+    if not guiObj or not guiObj.Visible then return false end
+    local absPos = guiObj.AbsolutePosition
+    local absSize = guiObj.AbsoluteSize
+    return pos.X >= absPos.X and pos.X <= (absPos.X + absSize.X)
+        and pos.Y >= absPos.Y and pos.Y <= (absPos.Y + absSize.Y)
+end
+
+local function isClickingOwnUi(pos)
+    if isPointInsideGui(uiRefs.Icon, pos) then
+        return true
+    end
+    if isPointInsideGui(uiRefs.Main, pos) then
+        return true
+    end
+    return false
 end
 
 local function matchesAllowedAbility(rawStr)
@@ -363,7 +507,7 @@ local function createUI()
 
     local Main = Instance.new("Frame")
     Main.Name = "MainFrame"
-    Main.Size = UDim2.new(0, 236, 0, 255)
+    Main.Size = UDim2.new(0, 236, 0, 272)
     Main.Position = UDim2.new(0.5, -100, 0.12, 0)
     Main.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
     Main.BorderSizePixel = 0
@@ -398,12 +542,24 @@ local function createUI()
     ToggleBtn.Parent = Main
     Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 8)
 
+    local PlatformInfo = Instance.new("TextLabel")
+    PlatformInfo.Name = "PlatformInfo"
+    PlatformInfo.Size = UDim2.new(1, -16, 0, 16)
+    PlatformInfo.Position = UDim2.new(0, 8, 0, 67)
+    PlatformInfo.BackgroundTransparency = 1
+    PlatformInfo.Text = "Platform: " .. detectedPlatform
+    PlatformInfo.TextColor3 = Color3.fromRGB(140, 255, 185)
+    PlatformInfo.Font = Enum.Font.GothamSemibold
+    PlatformInfo.TextSize = 11
+    PlatformInfo.TextXAlignment = Enum.TextXAlignment.Left
+    PlatformInfo.Parent = Main
+
     local TargetInfo = Instance.new("TextLabel")
     TargetInfo.Name = "TargetInfo"
-    TargetInfo.Size = UDim2.new(1, -16, 0, 20)
-    TargetInfo.Position = UDim2.new(0, 8, 0, 68)
+    TargetInfo.Size = UDim2.new(1, -16, 0, 18)
+    TargetInfo.Position = UDim2.new(0, 8, 0, 84)
     TargetInfo.BackgroundTransparency = 1
-    TargetInfo.Text = "Target: Nearest Player"
+    TargetInfo.Text = "Target: Nearest (" .. tostring(MAX_TWEEN_RANGE) .. "m)"
     TargetInfo.TextColor3 = Color3.fromRGB(150, 220, 255)
     TargetInfo.Font = Enum.Font.GothamSemibold
     TargetInfo.TextSize = 11
@@ -413,7 +569,7 @@ local function createUI()
     local SearchBox = Instance.new("TextBox")
     SearchBox.Name = "SearchBox"
     SearchBox.Size = UDim2.new(1, -16, 0, 28)
-    SearchBox.Position = UDim2.new(0, 8, 0, 90)
+    SearchBox.Position = UDim2.new(0, 8, 0, 105)
     SearchBox.BackgroundColor3 = Color3.fromRGB(26, 26, 34)
     SearchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
     SearchBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 145)
@@ -428,7 +584,7 @@ local function createUI()
     local PlayerList = Instance.new("ScrollingFrame")
     PlayerList.Name = "PlayerList"
     PlayerList.Size = UDim2.new(1, -16, 0, 118)
-    PlayerList.Position = UDim2.new(0, 8, 0, 125)
+    PlayerList.Position = UDim2.new(0, 8, 0, 138)
     PlayerList.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
     PlayerList.BorderSizePixel = 0
     PlayerList.ScrollBarThickness = 4
@@ -442,7 +598,10 @@ local function createUI()
     Layout.Parent = PlayerList
 
     uiRefs = {
+        Icon = Icon,
+        Main = Main,
         ToggleBtn = ToggleBtn,
+        PlatformInfo = PlatformInfo,
         TargetInfo = TargetInfo,
         PlayerList = PlayerList,
         Layout = Layout
@@ -459,6 +618,9 @@ local function createUI()
 
     ToggleBtn.Activated:Connect(function()
         isTpSkillEnabled = not isTpSkillEnabled
+        if not isTpSkillEnabled then
+            stopActiveMotion()
+        end
         refreshToggleButton()
     end)
 
@@ -467,6 +629,7 @@ local function createUI()
         rebuildPlayerList()
     end)
 
+    refreshPlatformLabel()
     refreshTargetLabel()
     refreshToggleButton()
     rebuildPlayerList()
@@ -475,7 +638,7 @@ end
 local function onCharacterAdded(c)
     char = c
     hrp = char:WaitForChild("HumanoidRootPart")
-    tpCooldown = false
+    stopActiveMotion()
     task.delay(0.5, scanAbilityButtons)
 end
 
@@ -490,9 +653,19 @@ local conns = {}
 conns[1] = LP.CharacterAdded:Connect(onCharacterAdded)
 
 conns[2] = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed or not isTpSkillEnabled then return end
+    if not isTpSkillEnabled then return end
+    if UserInputService:GetFocusedTextBox() then return end
 
-    if input.UserInputType == Enum.UserInputType.Keyboard then
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if detectedPlatform == "PC" and not gameProcessed and not isClickingOwnUi(input.Position) then
+            tpToTargetForHit()
+        end
+        return
+    end
+
+    if gameProcessed then return end
+
+    if input.UserInputType == Enum.UserInputType.Keyboard or input.UserInputType == Enum.UserInputType.Gamepad1 then
         local keyName = string.lower(input.KeyCode.Name)
         if SKILL_KEYS[keyName] then
             tpToTargetForHit()
@@ -520,5 +693,14 @@ conns[5] = Players.PlayerRemoving:Connect(function(plr)
     end
     rebuildPlayerList()
 end)
+
+conns[6] = UserInputService.LastInputTypeChanged:Connect(function()
+    detectedPlatform = detectPlatform()
+    refreshPlatformLabel()
+end)
+
+conns[7] = {
+    Disconnect = stopActiveMotion
+}
 
 _G.JJ1_Combo_Conns = conns
