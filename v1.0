@@ -1,0 +1,524 @@
+if _G.JJ1_Combo_Conns then
+    for _, v in pairs(_G.JJ1_Combo_Conns) do
+        pcall(function() v:Disconnect() end)
+    end
+    _G.JJ1_Combo_Conns = nil
+end
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LP = Players.LocalPlayer
+
+local isTpSkillEnabled = false
+local selectedTargetUserId = nil
+local searchQuery = ""
+local tpCooldown = false
+local currentScreenGui = nil
+
+local SKILL_KEYS = {
+    one = true, two = true, three = true, four = true,
+    e = true, q = true, r = true, f = true
+}
+
+local RAW_ABILITY_NAMES = {
+    "Slash",
+    "Behead",
+    "Ghasing Wound",
+    "Stab",
+    "Nova",
+    "Void Rush",
+    "Punch",
+    "Corrupt Nature",
+    "Walkspeed Override",
+    "Corrupt Energy",
+    "Carving Slash",
+    "Eviscerate",
+    "Demonic Pursuit",
+    "Infernal Cry",
+    "Swing",
+    "Ban-Wave",
+    "Ban-Streak",
+    "Entanglement",
+    "Mass Infection",
+    "Lacerate",
+    "Blood Hook",
+    "Hunter's Feast",
+    "Dive",
+    "Perforating",
+    "Dash",
+    "Fire",
+    "Ashes",
+    "Burn",
+    "Crystal Pitch",
+    "Hatchet",
+    "Subspace Tripmine",
+    "Charge",
+    "One Shot",
+    "Sacrificial Dagger",
+    "Spawn Protection",
+    "Plasma Beam",
+    "Zap",
+    "SK8",
+    "Inspire",
+    "Pulse",
+    "Quick Attack",
+    "Combo",
+    "Black Flash",
+    "Reversal Red",
+    "Blue",
+    "Hollow Purple",
+    "Sonic Speed"
+}
+
+local function normalizeAbilityName(str)
+    local s = string.lower(tostring(str or ""))
+    s = string.gsub(s, "[%-%_]", " ")
+    s = string.gsub(s, "[^%a%d%s]", "")
+    s = string.gsub(s, "%s+", " ")
+    s = string.match(s, "^%s*(.-)%s*$") or ""
+    return s
+end
+
+local ALLOWED_ABILITIES = {}
+for _, name in ipairs(RAW_ABILITY_NAMES) do
+    local norm = normalizeAbilityName(name)
+    if norm ~= "" then
+        ALLOWED_ABILITIES[norm] = true
+    end
+end
+
+local char = nil
+local hrp = nil
+local uiRefs = {}
+local hookedButtons = {}
+
+local function getTargetPlayer()
+    if selectedTargetUserId then
+        local plr = Players:GetPlayerByUserId(selectedTargetUserId)
+        if plr and plr ~= LP and plr.Character then
+            local tHrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            local tHum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if tHrp and tHum and tHum.Health > 0 then
+                return plr, tHrp
+            end
+        end
+    end
+
+    if not hrp then return nil, nil end
+
+    local closestPlr = nil
+    local closestHrp = nil
+    local bestDist = math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP and plr.Character then
+            local tHrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            local tHum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if tHrp and tHum and tHum.Health > 0 then
+                local dist = (tHrp.Position - hrp.Position).Magnitude
+                if dist < bestDist then
+                    bestDist = dist
+                    closestPlr = plr
+                    closestHrp = tHrp
+                end
+            end
+        end
+    end
+
+    return closestPlr, closestHrp
+end
+
+local function refreshTargetLabel()
+    if not uiRefs.TargetInfo then return end
+    if selectedTargetUserId then
+        local plr = Players:GetPlayerByUserId(selectedTargetUserId)
+        if plr then
+            uiRefs.TargetInfo.Text = "Target: " .. plr.DisplayName .. " (@" .. plr.Name .. ")"
+            return
+        end
+    end
+    uiRefs.TargetInfo.Text = "Target: Nearest Player"
+end
+
+local function refreshToggleButton()
+    if not uiRefs.ToggleBtn then return end
+    uiRefs.ToggleBtn.Text = isTpSkillEnabled and "Skill TP Hit: ON" or "Skill TP Hit: OFF"
+    uiRefs.ToggleBtn.BackgroundColor3 = isTpSkillEnabled and Color3.fromRGB(0, 185, 85) or Color3.fromRGB(220, 45, 45)
+end
+
+local function rebuildPlayerList()
+    local list = uiRefs.PlayerList
+    if not list then return end
+
+    for _, child in ipairs(list:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+
+    local q = string.lower(searchQuery or "")
+
+    local nearestBtn = Instance.new("TextButton")
+    nearestBtn.Name = "NearestOption"
+    nearestBtn.Size = UDim2.new(1, -6, 0, 28)
+    nearestBtn.BackgroundColor3 = (selectedTargetUserId == nil) and Color3.fromRGB(0, 135, 210) or Color3.fromRGB(34, 34, 44)
+    nearestBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nearestBtn.Font = Enum.Font.GothamBold
+    nearestBtn.TextSize = 11
+    nearestBtn.Text = "[Auto] Nearest Player"
+    nearestBtn.Parent = list
+    Instance.new("UICorner", nearestBtn).CornerRadius = UDim.new(0, 6)
+
+    nearestBtn.Activated:Connect(function()
+        selectedTargetUserId = nil
+        refreshTargetLabel()
+        rebuildPlayerList()
+    end)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local disp = string.lower(plr.DisplayName or "")
+            local user = string.lower(plr.Name or "")
+            if q == "" or string.find(disp, q, 1, true) or string.find(user, q, 1, true) then
+                local isSelected = (selectedTargetUserId == plr.UserId)
+                local itemBtn = Instance.new("TextButton")
+                itemBtn.Name = "Plr_" .. plr.UserId
+                itemBtn.Size = UDim2.new(1, -6, 0, 30)
+                itemBtn.BackgroundColor3 = isSelected and Color3.fromRGB(0, 165, 80) or Color3.fromRGB(30, 30, 38)
+                itemBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                itemBtn.Font = Enum.Font.GothamSemibold
+                itemBtn.TextSize = 11
+                itemBtn.TextXAlignment = Enum.TextXAlignment.Left
+                itemBtn.Text = "  " .. plr.DisplayName .. " (@" .. plr.Name .. ")"
+                itemBtn.Parent = list
+                Instance.new("UICorner", itemBtn).CornerRadius = UDim.new(0, 6)
+
+                itemBtn.Activated:Connect(function()
+                    selectedTargetUserId = plr.UserId
+                    refreshTargetLabel()
+                    rebuildPlayerList()
+                end)
+            end
+        end
+    end
+
+    task.defer(function()
+        if uiRefs.Layout and list then
+            list.CanvasSize = UDim2.new(0, 0, 0, uiRefs.Layout.AbsoluteContentSize.Y + 8)
+        end
+    end)
+end
+
+local function tpToTargetForHit()
+    if not isTpSkillEnabled or tpCooldown or not hrp or not hrp.Parent then return end
+
+    local _, targetHrp = getTargetPlayer()
+    if not targetHrp then return end
+
+    tpCooldown = true
+    local behindPos = targetHrp.Position - (targetHrp.CFrame.LookVector * 3) + Vector3.new(0, 0.5, 0)
+    hrp.CFrame = CFrame.lookAt(behindPos, targetHrp.Position)
+
+    task.delay(0.12, function()
+        tpCooldown = false
+    end)
+end
+
+local function matchesAllowedAbility(rawStr)
+    local norm = normalizeAbilityName(rawStr)
+    if norm == "" then return false end
+    if ALLOWED_ABILITIES[norm] then
+        return true
+    end
+    for abilityNorm in pairs(ALLOWED_ABILITIES) do
+        if string.find(norm, abilityNorm, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isValidAbilityButton(btn)
+    if not btn or not btn:IsA("GuiButton") then return false end
+    if currentScreenGui and btn:IsDescendantOf(currentScreenGui) then return false end
+
+    local sg = btn:FindFirstAncestorOfClass("ScreenGui")
+    if not sg or not sg.Enabled then
+        return false
+    end
+
+    if matchesAllowedAbility(btn.Name) then
+        return true
+    end
+
+    if btn.Parent and matchesAllowedAbility(btn.Parent.Name) then
+        return true
+    end
+
+    if btn:IsA("TextButton") and matchesAllowedAbility(btn.Text) then
+        return true
+    end
+
+    for _, child in ipairs(btn:GetDescendants()) do
+        if (child:IsA("TextLabel") or child:IsA("TextButton")) and matchesAllowedAbility(child.Text) then
+            return true
+        end
+        if matchesAllowedAbility(child.Name) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function hookAbilityButton(btn)
+    if hookedButtons[btn] or not isValidAbilityButton(btn) then return end
+    hookedButtons[btn] = true
+
+    btn.InputBegan:Connect(function(input)
+        if not isTpSkillEnabled then return end
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            tpToTargetForHit()
+        end
+    end)
+end
+
+local function scanAbilityButtons()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, obj in ipairs(pg:GetDescendants()) do
+        if obj:IsA("GuiButton") then
+            hookAbilityButton(obj)
+        end
+    end
+end
+
+local function bindDrag(handle, targetFrame, onTap)
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    local activeInput = nil
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            activeInput = input
+            dragStart = input.Position
+            startPos = targetFrame.Position
+        end
+    end)
+
+    handle.InputChanged:Connect(function(input)
+        if input == activeInput and dragging then
+            local delta = input.Position - dragStart
+            targetFrame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    handle.InputEnded:Connect(function(input)
+        if input == activeInput then
+            local movedDist = dragStart and (input.Position - dragStart).Magnitude or 0
+            dragging = false
+            activeInput = nil
+            if onTap and movedDist < 8 then
+                onTap()
+            end
+        end
+    end)
+end
+
+local function createUI()
+    local parentGui = (gethui and gethui()) or CoreGui or LP:WaitForChild("PlayerGui")
+    local old = parentGui:FindFirstChild("JJ1_SkillTP_UI")
+    if old then old:Destroy() end
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "JJ1_SkillTP_UI"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.DisplayOrder = 999
+    ScreenGui.Parent = parentGui
+    currentScreenGui = ScreenGui
+
+    local Icon = Instance.new("ImageButton")
+    Icon.Name = "ToggleIcon"
+    Icon.Size = UDim2.new(0, 48, 0, 48)
+    Icon.Position = UDim2.new(0.5, -160, 0.12, 0)
+    Icon.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    Icon.Image = "rbxassetid://113301831233217"
+    Icon.ScaleType = Enum.ScaleType.Crop
+    Icon.Active = true
+    Icon.Parent = ScreenGui
+    Instance.new("UICorner", Icon).CornerRadius = UDim.new(0, 12)
+    local iconStroke = Instance.new("UIStroke", Icon)
+    iconStroke.Color = Color3.fromRGB(0, 255, 140)
+    iconStroke.Thickness = 1.5
+
+    local Main = Instance.new("Frame")
+    Main.Name = "MainFrame"
+    Main.Size = UDim2.new(0, 236, 0, 255)
+    Main.Position = UDim2.new(0.5, -100, 0.12, 0)
+    Main.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+    Main.BorderSizePixel = 0
+    Main.Active = true
+    Main.Visible = false
+    Main.Parent = ScreenGui
+    Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
+    local mainStroke = Instance.new("UIStroke", Main)
+    mainStroke.Color = Color3.fromRGB(60, 60, 75)
+    mainStroke.Thickness = 1.2
+
+    local Header = Instance.new("TextLabel")
+    Header.Size = UDim2.new(1, -16, 0, 24)
+    Header.Position = UDim2.new(0, 8, 0, 4)
+    Header.BackgroundTransparency = 1
+    Header.Text = "JJ1 SKILL TP HIT"
+    Header.TextColor3 = Color3.fromRGB(230, 230, 240)
+    Header.Font = Enum.Font.GothamBold
+    Header.TextSize = 12
+    Header.TextXAlignment = Enum.TextXAlignment.Left
+    Header.Parent = Main
+
+    local ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Name = "SkillTpToggle"
+    ToggleBtn.Size = UDim2.new(1, -16, 0, 34)
+    ToggleBtn.Position = UDim2.new(0, 8, 0, 30)
+    ToggleBtn.BackgroundColor3 = isTpSkillEnabled and Color3.fromRGB(0, 185, 85) or Color3.fromRGB(220, 45, 45)
+    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ToggleBtn.Font = Enum.Font.GothamBold
+    ToggleBtn.TextSize = 13
+    ToggleBtn.Text = isTpSkillEnabled and "Skill TP Hit: ON" or "Skill TP Hit: OFF"
+    ToggleBtn.Parent = Main
+    Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 8)
+
+    local TargetInfo = Instance.new("TextLabel")
+    TargetInfo.Name = "TargetInfo"
+    TargetInfo.Size = UDim2.new(1, -16, 0, 20)
+    TargetInfo.Position = UDim2.new(0, 8, 0, 68)
+    TargetInfo.BackgroundTransparency = 1
+    TargetInfo.Text = "Target: Nearest Player"
+    TargetInfo.TextColor3 = Color3.fromRGB(150, 220, 255)
+    TargetInfo.Font = Enum.Font.GothamSemibold
+    TargetInfo.TextSize = 11
+    TargetInfo.TextXAlignment = Enum.TextXAlignment.Left
+    TargetInfo.Parent = Main
+
+    local SearchBox = Instance.new("TextBox")
+    SearchBox.Name = "SearchBox"
+    SearchBox.Size = UDim2.new(1, -16, 0, 28)
+    SearchBox.Position = UDim2.new(0, 8, 0, 90)
+    SearchBox.BackgroundColor3 = Color3.fromRGB(26, 26, 34)
+    SearchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SearchBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 145)
+    SearchBox.PlaceholderText = "Search display or @username..."
+    SearchBox.Text = searchQuery
+    SearchBox.ClearTextOnFocus = false
+    SearchBox.Font = Enum.Font.Gotham
+    SearchBox.TextSize = 11
+    SearchBox.Parent = Main
+    Instance.new("UICorner", SearchBox).CornerRadius = UDim.new(0, 7)
+
+    local PlayerList = Instance.new("ScrollingFrame")
+    PlayerList.Name = "PlayerList"
+    PlayerList.Size = UDim2.new(1, -16, 0, 118)
+    PlayerList.Position = UDim2.new(0, 8, 0, 125)
+    PlayerList.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+    PlayerList.BorderSizePixel = 0
+    PlayerList.ScrollBarThickness = 4
+    PlayerList.CanvasSize = UDim2.new(0, 0, 0, 0)
+    PlayerList.Parent = Main
+    Instance.new("UICorner", PlayerList).CornerRadius = UDim.new(0, 7)
+
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 4)
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+    Layout.Parent = PlayerList
+
+    uiRefs = {
+        ToggleBtn = ToggleBtn,
+        TargetInfo = TargetInfo,
+        PlayerList = PlayerList,
+        Layout = Layout
+    }
+
+    bindDrag(Icon, Icon, function()
+        Main.Visible = not Main.Visible
+        if Main.Visible then
+            rebuildPlayerList()
+        end
+    end)
+
+    bindDrag(Header, Main, nil)
+
+    ToggleBtn.Activated:Connect(function()
+        isTpSkillEnabled = not isTpSkillEnabled
+        refreshToggleButton()
+    end)
+
+    SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        searchQuery = SearchBox.Text
+        rebuildPlayerList()
+    end)
+
+    refreshTargetLabel()
+    refreshToggleButton()
+    rebuildPlayerList()
+end
+
+local function onCharacterAdded(c)
+    char = c
+    hrp = char:WaitForChild("HumanoidRootPart")
+    tpCooldown = false
+    task.delay(0.5, scanAbilityButtons)
+end
+
+if LP.Character then
+    onCharacterAdded(LP.Character)
+end
+createUI()
+scanAbilityButtons()
+
+local conns = {}
+
+conns[1] = LP.CharacterAdded:Connect(onCharacterAdded)
+
+conns[2] = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or not isTpSkillEnabled then return end
+
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        local keyName = string.lower(input.KeyCode.Name)
+        if SKILL_KEYS[keyName] then
+            tpToTargetForHit()
+        end
+    end
+end)
+
+local pg = LP:FindFirstChild("PlayerGui")
+if pg then
+    conns[3] = pg.DescendantAdded:Connect(function(desc)
+        if desc:IsA("GuiButton") then
+            hookAbilityButton(desc)
+        end
+    end)
+end
+
+conns[4] = Players.PlayerAdded:Connect(function()
+    rebuildPlayerList()
+end)
+
+conns[5] = Players.PlayerRemoving:Connect(function(plr)
+    if selectedTargetUserId == plr.UserId then
+        selectedTargetUserId = nil
+        refreshTargetLabel()
+    end
+    rebuildPlayerList()
+end)
+
+_G.JJ1_Combo_Conns = conns
